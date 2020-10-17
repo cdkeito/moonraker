@@ -9,6 +9,7 @@ import time
 import json
 import errno
 import logging
+from collections import deque
 from utils import ServerError
 from tornado import gen
 from tornado.ioloop import IOLoop
@@ -18,6 +19,7 @@ MIN_EST_TIME = 10.
 
 class PanelDueError(ServerError):
     pass
+
 
 RESTART_GCODES = ["RESTART", "FIRMWARE_RESTART"]
 
@@ -139,6 +141,8 @@ class PanelDue:
         self.last_gcode_response = None
         self.current_file = ""
         self.file_metadata = {}
+        self.enable_checksum = config.getboolean('enable_checksum', True)
+        self.debug_queue = deque(maxlen=100)
 
         # Initialize tracked state.
         self.printer_state = {
@@ -303,44 +307,48 @@ class PanelDue:
                 {'beep_freq': frequency, 'beep_length': duration})
 
     async def process_line(self, line):
+        self.debug_queue.append(line)
         # If we find M112 in the line then skip verification
         if "M112" in line.upper():
             await self.klippy_apis.emergency_stop()
             return
 
-        # Get line number
-        line_index = line.find(' ')
-        try:
-            line_no = int(line[1:line_index])
-        except Exception:
-            line_index = -1
-            line_no = None
+        if self.enable_checksum:
+            # Get line number
+            line_index = line.find(' ')
+            try:
+                line_no = int(line[1:line_index])
+            except Exception:
+                line_index = -1
+                line_no = None
 
-        # Verify checksum
-        cs_index = line.rfind('*')
-        try:
-            checksum = int(line[cs_index+1:])
-        except Exception:
-            # Invalid checksum, do not process
-            msg = "!! Invalid Checksum"
-            if line_no is not None:
-                msg += f" Line Number: {line_no}"
-            logging.exception("PanelDue: " + msg)
-            raise PanelDueError(msg)
+            # Verify checksum
+            cs_index = line.rfind('*')
+            try:
+                checksum = int(line[cs_index+1:])
+            except Exception:
+                # Invalid checksum, do not process
+                msg = "!! Invalid Checksum"
+                if line_no is not None:
+                    msg += f" Line Number: {line_no}"
+                logging.exception("PanelDue: " + msg)
+                raise PanelDueError(msg)
 
-        # Checksum is calculated by XORing every byte in the line other
-        # than the checksum itself
-        calculated_cs = 0
-        for c in line[:cs_index]:
-            calculated_cs ^= ord(c)
-        if calculated_cs & 0xFF != checksum:
-            msg = "!! Invalid Checksum"
-            if line_no is not None:
-                msg += f" Line Number: {line_no}"
-            logging.info("PanelDue: " + msg)
-            raise PanelDueError(msg)
+            # Checksum is calculated by XORing every byte in the line other
+            # than the checksum itself
+            calculated_cs = 0
+            for c in line[:cs_index]:
+                calculated_cs ^= ord(c)
+            if calculated_cs & 0xFF != checksum:
+                msg = "!! Invalid Checksum"
+                if line_no is not None:
+                    msg += f" Line Number: {line_no}"
+                logging.info("PanelDue: " + msg)
+                raise PanelDueError(msg)
 
-        await self._run_gcode(line[line_index+1:cs_index])
+            await self._run_gcode(line[line_index+1:cs_index])
+        else:
+            await self._run_gcode(line)
 
     async def _run_gcode(self, script):
         # Execute the gcode.  Check for special RRF gcodes that
@@ -723,6 +731,10 @@ class PanelDue:
 
     async def close(self):
         self.ser_conn.disconnect()
+        msg = "\nPanelDue GCode Dump:"
+        for i, gc in enumerate(self.debug_queue):
+            msg += f"\nSequence {i}: {gc}"
+        logging.debug(msg)
 
 def load_plugin(config):
     return PanelDue(config)

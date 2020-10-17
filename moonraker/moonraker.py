@@ -13,7 +13,8 @@ import logging
 import json
 import confighelper
 import utils
-from tornado import iostream
+import asyncio
+from tornado import iostream, gen
 from tornado.ioloop import IOLoop
 from tornado.util import TimeoutError
 from tornado.locks import Event
@@ -69,6 +70,8 @@ class Server:
 
         self.register_endpoint(
             "/server/info", ['GET'], self._handle_info_request)
+        self.register_endpoint(
+            "/server/restart", ['POST'], self._handle_server_restart)
 
         # Setup remote methods accessable to Klippy.  Note that all
         # registered remote methods should be of the notification type,
@@ -86,8 +89,10 @@ class Server:
         self._load_plugins(config)
 
     def start(self):
+        hostname, hostport = self.get_host_info()
         logging.info(
-            f"Starting Moonraker on ({self.host}, {self.port})")
+            f"Starting Moonraker on ({self.host}, {hostport}), "
+            f"Hostname: {hostname}")
         self.moonraker_app.listen(self.host, self.port)
         self.server_running = True
         self.ioloop.spawn_callback(self._connect_klippy)
@@ -153,8 +158,14 @@ class Server:
             return
         self.remote_methods[method_name] = cb
 
+    def get_host_info(self):
+        hostname = socket.gethostname()
+        return hostname, self.port
+
     # ***** Klippy Connection *****
     async def _connect_klippy(self):
+        if not self.server_running:
+            return
         ret = await self.klippy_connection.connect(self.klippy_address)
         if not ret:
             self.ioloop.call_later(.25, self._connect_klippy)
@@ -200,14 +211,19 @@ class Server:
         self.send_event("server:klippy_disconnect")
         if self.init_handle is not None:
             self.ioloop.remove_timeout(self.init_handle)
-        self.ioloop.call_later(.25, self._connect_klippy)
+        if self.server_running:
+            self.ioloop.call_later(.25, self._connect_klippy)
 
     async def _initialize(self):
+        if not self.server_running:
+            return
         await self._check_ready()
         await self._request_endpoints()
         # Subscribe to "webhooks"
         # Register "webhooks" subscription
         if "webhooks_sub" not in self.init_list:
+            temp_subs = self.all_subscriptions
+            self.all_subscriptions = {}
             try:
                 await self.klippy_apis.subscribe_objects({'webhooks': None})
             except ServerError as e:
@@ -215,6 +231,7 @@ class Server:
             else:
                 logging.info("Webhooks Subscribed")
                 self.init_list.append("webhooks_sub")
+            self.all_subscriptions.update(temp_subs)
         # Subscribe to Gcode Output
         if "gcode_output_sub" not in self.init_list:
             try:
@@ -281,6 +298,10 @@ class Server:
             logging.info(
                 f"Unable to retreive Klipper Object List")
             return
+        # Remove stale objects from the persistent subscription dict
+        for name in list(self.all_subscriptions.keys()):
+            if name not in result:
+                del self.all_subscriptions[name]
         req_objs = set(["virtual_sdcard", "display_status", "pause_resume"])
         missing_objs = req_objs - set(result)
         if missing_objs:
@@ -349,19 +370,21 @@ class Server:
         return result
 
     async def _stop_server(self):
-        # XXX - Currently this function is not used.
-        # Should I expose functionality to shutdown
-        # or restart the server, or simply remove this?
-        logging.info(
-            "Shutting Down Webserver")
-        for plugin in self.plugins:
+        self.server_running = False
+        for name, plugin in self.plugins.items():
             if hasattr(plugin, "close"):
-                await plugin.close()
+                ret = plugin.close()
+                if asyncio.iscoroutine(ret):
+                    await ret
         self.klippy_connection.close()
-        if self.server_running:
-            self.server_running = False
-            await self.moonraker_app.close()
-            self.ioloop.stop()
+        while self.klippy_state != "disconnected":
+            await gen.sleep(.1)
+        await self.moonraker_app.close()
+        self.ioloop.stop()
+
+    async def _handle_server_restart(self, path, method, args):
+        self.ioloop.spawn_callback(self._stop_server)
+        return "ok"
 
     async def _handle_info_request(self, path, method, args):
         return {
@@ -487,20 +510,29 @@ def main():
 
     # Start IOLoop and Server
     io_loop = IOLoop.current()
-    try:
-        server = Server(cmd_line_args)
-    except Exception:
-        logging.exception("Moonraker Error")
-        ql.stop()
-        exit(1)
-    try:
-        server.start()
-        io_loop.start()
-    except Exception:
-        logging.exception("Server Running Error")
+    estatus = 0
+    while True:
+        try:
+            server = Server(cmd_line_args)
+        except Exception:
+            logging.exception("Moonraker Error")
+            estatus = 1
+            break
+        try:
+            server.start()
+            io_loop.start()
+        except Exception:
+            logging.exception("Server Running Error")
+            estatus = 1
+            break
+        # Since we are running outside of the the server
+        # it is ok to use a blocking sleep here
+        time.sleep(.5)
+        logging.info("Attempting Server Restart...")
     io_loop.close(True)
     logging.info("Server Shutdown")
     ql.stop()
+    exit(estatus)
 
 
 if __name__ == '__main__':
