@@ -483,6 +483,10 @@ class BaseRequest:
                 'params': self.params}
 
 def main():
+    # patch to start under windows
+    if sys.platform == 'win32':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
     # Parse start arguments
     parser = argparse.ArgumentParser(
         description="Moonraker - Klipper API Server")
