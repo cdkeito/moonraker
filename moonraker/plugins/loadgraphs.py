@@ -1,8 +1,19 @@
-# This file is provided as-is.
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 # This file may be distributed under the terms of the GNU GPLv3 license.
-# ArcWelderConsole project site is https://github.com/FormerLurker/ArcWelderLib
 
-# To enable, add [arcwelder] to moonraker config file "moonraker.conf"
+# To enable, add to moonraker config file "moonraker.conf"
+# [loadgraphs]
+# graphstatsPath: /home/pi/klipper/scripts/graphstats.py
+# graphstatsTimeOut: 3600
+# klippyLogPath: /tmp/klippy.log
+# targetDir: /home/pi/mainsail/img/loadgraphs
+# targetUrl: /img/loadgraphs
 
 import os
 import logging
