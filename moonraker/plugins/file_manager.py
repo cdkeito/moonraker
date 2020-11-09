@@ -10,10 +10,10 @@ import io
 import zipfile
 import logging
 import json
-from tornado.ioloop import IOLoop
+from tornado.ioloop import IOLoop, PeriodicCallback
 from tornado.locks import Lock
 
-VALID_GCODE_EXTS = ['gcode', 'g', 'gco']
+VALID_GCODE_EXTS = ['.gcode', '.g', '.gco']
 FULL_ACCESS_ROOTS = ["gcodes", "config"]
 METADATA_SCRIPT = os.path.join(
     os.path.dirname(__file__), "../../scripts/extract_metadata.py")
@@ -22,7 +22,6 @@ class FileManager:
     def __init__(self, config):
         self.server = config.get_server()
         self.file_paths = {}
-        self.file_lists = {}
         self.gcode_metadata = MetadataStorage(self.server)
         self.fixed_path_args = {}
 
@@ -72,7 +71,7 @@ class FileManager:
         log_path = os.path.normpath(os.path.expanduser(log_file))
         self.server.register_static_file_handler("klippy.log", log_path)
 
-    def register_directory(self, base, path):
+    def register_directory(self, root, path):
         if path is None:
             return False
         home = os.path.expanduser('~')
@@ -80,18 +79,21 @@ class FileManager:
         if not os.path.isdir(path) or not path.startswith(home) or \
                 path == home:
             logging.info(
-                f"\nSupplied path ({path}) for ({base}) not valid. Please\n"
+                f"\nSupplied path ({path}) for ({root}) not valid. Please\n"
                 "check that the path exists and is a subfolder in the HOME\n"
                 "directory. Note that the path may not BE the home directory.")
             return False
-        if path != self.file_paths.get(base, ""):
-            self.file_paths[base] = path
-            self.server.register_static_file_handler(base, path)
-            try:
-                self._update_file_list(base=base)
-            except Exception:
-                logging.exception(
-                    f"Unable to initialize file list: <{base}>")
+        if path != self.file_paths.get(root, ""):
+            self.file_paths[root] = path
+            self.server.register_static_file_handler(root, path)
+            if root == "gcodes":
+                # scan metadata
+                self.gcode_metadata.update_gcode_path(path)
+                try:
+                    self.get_file_list("gcodes")
+                except Exception:
+                    logging.exception(
+                        f"Unable to initialize gcode metadata")
         return True
 
     def get_sd_directory(self):
@@ -102,11 +104,11 @@ class FileManager:
 
     async def _handle_filelist_request(self, path, method, args):
         root = args.get('root', "gcodes")
-        return self.get_file_list(format_list=True, base=root)
+        return self.get_file_list(root, list_format=True, notify=True)
 
     async def _handle_metadata_request(self, path, method, args):
         requested_file = args.get('filename')
-        metadata = self.gcode_metadata.get(requested_file)
+        metadata = self.gcode_metadata.get(requested_file, None)
         if metadata is None:
             raise self.server.error(
                 f"Metadata not available for <{requested_file}>", 404)
@@ -115,34 +117,41 @@ class FileManager:
 
     async def _handle_directory_request(self, path, method, args):
         directory = args.get('path', "gcodes")
-        base, url_path, dir_path = self._convert_path(directory)
+        root, rel_path, dir_path = self._convert_path(directory)
         method = method.upper()
         if method == 'GET':
+            is_extended = args.get('extended', False)
+            if isinstance(is_extended, str):
+                val = is_extended.lower()
+                if val in ["true", "false"]:
+                    is_extended = True if val == "true" else False
+            if not isinstance(is_extended, bool):
+                raise self.server.error(
+                    f"Invalid argument for 'extended': {is_extended}")
             # Get list of files and subdirectories for this target
             dir_info = self._list_directory(dir_path)
             # Check to see if a filelist update is necessary
             for f in dir_info['files']:
-                fname = os.path.join(url_path, f['filename'])
-                ext = f['filename'][f['filename'].rfind('.')+1:]
-                if base == 'gcodes' and ext not in VALID_GCODE_EXTS:
+                fname = os.path.join(rel_path, f['filename'])
+                ext = os.path.splitext(f['filename'])[-1].lower()
+                if root != 'gcodes' or ext not in VALID_GCODE_EXTS:
                     continue
-                finfo = self.file_lists[base].get(fname, None)
-                if finfo is None or f['modified'] != finfo['modified']:
-                    # Either a new file found or file has changed, update
-                    # internal file list
-                    self._update_file_list(base, do_notify=True)
-                    break
+                self.gcode_metadata.parse_metadata(
+                    fname, f['size'], f['modified'], notify=True)
+                metadata = self.gcode_metadata.get(fname, None)
+                if metadata is not None and is_extended:
+                    f.update(metadata)
             return dir_info
-        elif method == 'POST' and base in FULL_ACCESS_ROOTS:
+        elif method == 'POST' and root in FULL_ACCESS_ROOTS:
             # Create a new directory
             try:
                 os.mkdir(dir_path)
             except Exception as e:
                 raise self.server.error(str(e))
-            self.notify_filelist_changed("create_dir", url_path, base)
-        elif method == 'DELETE' and base in FULL_ACCESS_ROOTS:
+            self.notify_filelist_changed("create_dir", rel_path, root)
+        elif method == 'DELETE' and root in FULL_ACCESS_ROOTS:
             # Remove a directory
-            if directory.strip("/") == base:
+            if directory.strip("/") == root:
                 raise self.server.error(
                     "Cannot delete root directory")
             if not os.path.isdir(dir_path):
@@ -156,12 +165,14 @@ class FileManager:
                 # loaded by the virtual_sdcard
                 await self._handle_operation_check(dir_path)
                 shutil.rmtree(dir_path)
+                if root == "gcodes":
+                    self.gcode_metadata.prune_metadata()
             else:
                 try:
                     os.rmdir(dir_path)
                 except Exception as e:
                     raise self.server.error(str(e))
-            self.notify_filelist_changed("delete_dir", url_path, base)
+            self.notify_filelist_changed("delete_dir", rel_path, root)
         else:
             raise self.server.error("Operation Not Supported", 405)
         return "ok"
@@ -185,19 +196,20 @@ class FileManager:
         ongoing = state in ["printing", "paused"]
         return ongoing
 
-    def _convert_path(self, url_path):
-        parts = url_path.strip("/").split("/")
+    def _convert_path(self, request_path):
+        # Parse the root, relative path, and disk path from a remote request
+        parts = request_path.strip("/").split("/")
         if not parts:
-            raise self.server.error(f"Invalid path: {url_path}")
-        base = parts[0]
-        if base not in self.file_paths:
-            raise self.server.error(f"Invalid base path ({base})")
-        root_path = local_path = self.file_paths[base]
-        url_path = ""
+            raise self.server.error(f"Invalid path: {request_path}")
+        root = parts[0]
+        if root not in self.file_paths:
+            raise self.server.error(f"Invalid root path ({root})")
+        disk_path = self.file_paths[root]
+        rel_path = ""
         if len(parts) > 1:
-            url_path = "/".join(parts[1:])
-            local_path = os.path.join(root_path, url_path)
-        return base, url_path, local_path
+            rel_path = "/".join(parts[1:])
+            disk_path = os.path.join(disk_path, rel_path)
+        return root, rel_path, disk_path
 
     async def _handle_file_move_copy(self, path, method, args):
         source = args.get("source")
@@ -207,11 +219,11 @@ class FileManager:
         if destination is None:
             raise self.server.error(
                 "File move/copy request missing destination")
-        source_base, src_url_path, source_path = self._convert_path(source)
-        dest_base, dst_url_path, dest_path = self._convert_path(destination)
-        if dest_base not in FULL_ACCESS_ROOTS:
+        source_root, src_rel_path, source_path = self._convert_path(source)
+        dest_root, dst_rel_path, dest_path = self._convert_path(destination)
+        if dest_root not in FULL_ACCESS_ROOTS:
             raise self.server.error(
-                f"Destination path is read-only: {dest_base}")
+                f"Destination path is read-only: {dest_root}")
         if not os.path.exists(source_path):
             raise self.server.error(f"File {source_path} does not exist")
         # make sure the destination is not in use
@@ -219,15 +231,20 @@ class FileManager:
             await self._handle_operation_check(dest_path)
         action = op_result = ""
         if path == "/server/files/move":
-            if source_base not in FULL_ACCESS_ROOTS:
+            if source_root not in FULL_ACCESS_ROOTS:
                 raise self.server.error(
-                    f"Source path is read-only, cannot move: {source_base}")
+                    f"Source path is read-only, cannot move: {source_root}")
             # if moving the file, make sure the source is not in use
             await self._handle_operation_check(source_path)
             try:
                 op_result = shutil.move(source_path, dest_path)
             except Exception as e:
                 raise self.server.error(str(e))
+            if source_root == "gcodes":
+                if os.path.isdir(op_result):
+                    self.gcode_metadata.prune_metadata()
+                else:
+                    self.gcode_metadata.remove_file(src_rel_path)
             action = "move_item"
         elif path == "/server/files/copy":
             try:
@@ -239,11 +256,11 @@ class FileManager:
                 raise self.server.error(str(e))
             action = "copy_item"
         if op_result != dest_path:
-            dst_url_path = os.path.join(
-                dst_url_path, os.path.basename(op_result))
+            dst_rel_path = os.path.join(
+                dst_rel_path, os.path.basename(op_result))
         self.notify_filelist_changed(
-            action, dst_url_path, dest_base,
-            {'path': src_url_path, 'root': source_base})
+            action, dst_rel_path, dest_root,
+            {'path': src_rel_path, 'root': source_root})
         return "ok"
 
     def _list_directory(self, path):
@@ -268,32 +285,6 @@ class FileManager:
         path_info = {'modified': modified, 'size': size}
         return path_info
 
-    def _update_file_list(self, base='gcodes', do_notify=False):
-        # Use os.walk find files in sd path and subdirs
-        path = self.file_paths.get(base, None)
-        if path is None:
-            msg = f"No known path for root: {base}"
-            logging.info(msg)
-            raise self.server.error(msg)
-        elif not os.path.isdir(path):
-            msg = f"Cannot generate file list for root: {base}"
-            logging.info(msg)
-            raise self.server.error(msg)
-        logging.info(f"Updating File List <{base}>...")
-        new_list = {}
-        for root, dirs, files in os.walk(path, followlinks=True):
-            for name in files:
-                ext = name[name.rfind('.')+1:]
-                if base == 'gcodes' and ext not in VALID_GCODE_EXTS:
-                    continue
-                full_path = os.path.join(root, name)
-                r_path = full_path[len(path) + 1:]
-                new_list[r_path] = self._get_path_info(full_path)
-        self.file_lists[base] = new_list
-        if base == 'gcodes':
-            self.gcode_metadata.refresh_metadata(new_list, path, do_notify)
-        return dict(new_list)
-
     async def process_file_upload(self, request):
         # lookup root file path
         root = self._get_argument(request, 'root', "gcodes")
@@ -307,11 +298,11 @@ class FileManager:
 
     async def _do_gcode_upload(self, request):
         start_print = print_ongoing = False
-        base_path = self.file_paths.get("gcodes", "")
-        if not base_path:
+        root_path = self.file_paths.get("gcodes", "")
+        if not root_path:
             raise self.server.error("Gcodes root not available")
         start_print = self._get_argument(request, 'print', "false") == "true"
-        upload = self._get_upload_info(request, base_path)
+        upload = self._get_upload_info(request, root_path)
         fparts = os.path.splitext(upload['full_path'])
         is_ufp = fparts[-1].lower() == ".ufp"
         # Verify that the operation can be done if attempting to upload a gcode
@@ -359,7 +350,7 @@ class FileManager:
             return args[0].decode().strip()
         return default
 
-    def _get_upload_info(self, request, base_path):
+    def _get_upload_info(self, request, root_path):
         # check relative path
         dir_path = self._get_argument(request, 'path', "")
         # fetch the upload from the request
@@ -371,17 +362,17 @@ class FileManager:
             raise self.server.error(
                 "Bad Request, can only process a single file upload")
         upload = f_list[0]
-        if os.path.isfile(base_path):
-            filename = os.path.basename(base_path)
-            full_path = base_path
+        if os.path.isfile(root_path):
+            filename = os.path.basename(root_path)
+            full_path = root_path
             dir_path = ""
         else:
             filename = "_".join(upload['filename'].strip().split()).lstrip("/")
             if dir_path:
                 filename = os.path.join(dir_path, filename)
-            full_path = os.path.normpath(os.path.join(base_path, filename))
+            full_path = os.path.normpath(os.path.join(root_path, filename))
         # Validate the path.  Don't allow uploads to a parent of the root
-        if not full_path.startswith(base_path):
+        if not full_path.startswith(root_path):
             raise self.server.error(
                 f"Cannot write to path: {full_path}")
         return {
@@ -440,14 +431,28 @@ class FileManager:
             except Exception:
                 logging.exception("Unable to write Image")
 
-    def get_file_list(self, format_list=False, base='gcodes'):
-        try:
-            filelist = self._update_file_list(base)
-        except Exception:
-            msg = "Unable to update file list"
-            logging.exception(msg)
+    def get_file_list(self, root, list_format=False, notify=False):
+        # Use os.walk find files in sd path and subdirs
+        filelist = {}
+        path = self.file_paths.get(root, None)
+        if path is None or not os.path.isdir(path):
+            msg = f"Failed to build file list, invalid path: {root}: {path}"
+            logging.info(msg)
             raise self.server.error(msg)
-        if format_list:
+        logging.info(f"Updating File List <{root}>...")
+        for root_path, dirs, files in os.walk(path, followlinks=True):
+            for name in files:
+                ext = os.path.splitext(name)[-1].lower()
+                if root == 'gcodes' and ext not in VALID_GCODE_EXTS:
+                    continue
+                full_path = os.path.join(root_path, name)
+                fname = full_path[len(path) + 1:]
+                finfo = self._get_path_info(full_path)
+                filelist[fname] = finfo
+                if root == 'gcodes':
+                    self.gcode_metadata.parse_metadata(
+                        fname, finfo['size'], finfo['modified'], notify)
+        if list_format:
             flist = []
             for fname in sorted(filelist, key=str.lower):
                 fdict = {'filename': fname}
@@ -465,7 +470,7 @@ class FileManager:
         if filename.startswith('gcodes/'):
             filename = filename[7:]
 
-        flist = self.get_file_list()
+        flist = self.get_file_list("gcodes")
         return self.gcode_metadata.get(filename, flist.get(filename, {}))
 
     def list_dir(self, directory, simple_format=False):
@@ -493,7 +498,7 @@ class FileManager:
                 simple_list.append("*" + dirobj['dirname'])
             for fileobj in flist['files']:
                 fname = fileobj['filename']
-                ext = fname[fname.rfind('.')+1:]
+                ext = os.path.splitext(fname)[-1].lower()
                 if root == "gcodes" and ext in VALID_GCODE_EXTS:
                     simple_list.append(fname)
             return simple_list
@@ -523,32 +528,55 @@ class FileManager:
             except self.server.error as e:
                 if e.status_code == 403:
                     raise
+            self.gcode_metadata.remove_file(filename)
         os.remove(full_path)
         self.notify_filelist_changed('delete_file', filename, root)
         return filename
 
-    def notify_filelist_changed(self, action, fname, base, source_item={}):
-        self._update_file_list(base, do_notify=True)
-        file_info = dict(self.file_lists[base].get(
-            fname, {'size': 0, 'modified': 0}))
-        file_info.update({'path': fname, 'root': base})
+    def notify_filelist_changed(self, action, fname, root, source_item={}):
+        flist = self.get_file_list(root, notify=True)
+        file_info = flist.get(fname, {'size': 0, 'modified': 0})
+        file_info.update({'path': fname, 'root': root})
         result = {'action': action, 'item': file_info}
         if source_item:
             result.update({'source_item': source_item})
         self.server.send_event("file_manager:filelist_changed", result)
 
+    def close(self):
+        self.gcode_metadata.close()
+
+
+METADATA_PRUNE_TIME = 600000
+
 class MetadataStorage:
     def __init__(self, server):
         self.server = server
-        self.lock = Lock()
         self.metadata = {}
+        self.pending_requests = {}
         self.script_response = None
+        self.busy = False
+        self.gc_path = os.path.expanduser("~")
+        self.prune_cb = PeriodicCallback(
+            self.prune_metadata, METADATA_PRUNE_TIME)
+
+    def update_gcode_path(self, path):
+        if path == self.gc_path:
+            return
+        self.metadata = {}
+        self.gc_path = path
+        if not self.prune_cb.is_running():
+            self.prune_cb.start()
+
+    def close(self):
+        self.prune_cb.stop()
 
     def get(self, key, default=None):
-        return self.metadata.get(key, default)
+        if key not in self.metadata:
+            return default
+        return dict(self.metadata[key])
 
     def __getitem__(self, key):
-        return self.metadata[key]
+        return dict(self.metadata[key])
 
     def _handle_script_response(self, result):
         try:
@@ -563,40 +591,55 @@ class MetadataStorage:
         if 'file' in proc_resp:
             self.script_response = proc_resp
 
-    def refresh_metadata(self, filelist, gc_path, do_notify=False):
-        IOLoop.current().spawn_callback(
-            self._do_metadata_update, filelist, gc_path, do_notify)
+    def prune_metadata(self):
+        for fname in list(self.metadata.keys()):
+            fpath = os.path.join(self.gc_path, fname)
+            if not os.path.exists(fpath):
+                del self.metadata[fname]
+                logging.info(f"Pruned file: {fname}")
+                continue
 
-    async def _do_metadata_update(self, filelist, gc_path, do_notify=False):
-        async with self.lock:
-            exisiting_data = {}
-            update_list = []
-            for fname, fdata in filelist.items():
-                mdata = self.metadata.get(fname, {})
-                if mdata.get('size', "") == fdata.get('size') \
-                        and mdata.get('modified', 0) == fdata.get('modified'):
-                    # file metadata has already been extracted
-                    exisiting_data[fname] = mdata
-                else:
-                    update_list.append(fname)
-            self.metadata = exisiting_data
-            for fname in update_list:
-                retries = 3
-                while retries:
-                    try:
-                        await self._extract_metadata(fname, gc_path, do_notify)
-                    except Exception:
-                        logging.exception("Error running extract_metadata.py")
-                        retries -= 1
-                    else:
-                        break
-                else:
-                    logging.info(
-                        f"Unable to extract medatadata from file: {fname}")
+    def _has_valid_data(self, fname, fsize, modified):
+        mdata = self.metadata.get(fname, {'size': "", 'modified': 0})
+        return mdata['size'] == fsize and mdata['modified'] == modified
 
-    async def _extract_metadata(self, filename, path, do_notify=False):
+    def remove_file(self, fname):
+        self.metadata.pop(fname)
+
+    def parse_metadata(self, fname, fsize, modified, notify=False):
+        if fname in self.pending_requests or \
+                self._has_valid_data(fname, fsize, modified):
+            # request already pending or not necessary
+            return
+        self.pending_requests[fname] = (fsize, modified, notify)
+        if self.busy:
+            return
+        self.busy = True
+        IOLoop.current().spawn_callback(self._process_metadata_update)
+
+    async def _process_metadata_update(self):
+        while self.pending_requests:
+            fname, (fsize, modified, notify) = self.pending_requests.popitem()
+            if self._has_valid_data(fname, fsize, modified):
+                continue
+            retries = 3
+            while retries:
+                try:
+                    await self._run_extract_metadata(fname, notify)
+                except Exception:
+                    logging.exception("Error running extract_metadata.py")
+                    retries -= 1
+                else:
+                    break
+            else:
+                self.metadata[fname] = {'size': fsize, 'modified': modified}
+                logging.info(
+                    f"Unable to extract medatadata from file: {fname}")
+        self.busy = False
+
+    async def _run_extract_metadata(self, filename, notify):
         cmd = " ".join([sys.executable, METADATA_SCRIPT, "-p",
-                        path, "-f", "'" + filename + "'"])
+                        self.gc_path, "-f", "'" + filename + "'"])
         shell_command = self.server.lookup_plugin('shell_command')
         scmd = shell_command.build_shell_command(
             cmd, self._handle_script_response)
@@ -611,7 +654,7 @@ class MetadataStorage:
             raise self.server.error("Unable to extract metadata")
         self.metadata[path] = dict(metadata)
         metadata['filename'] = path
-        if do_notify:
+        if notify:
             self.server.send_event(
                 "file_manager:metadata_update", metadata)
 
