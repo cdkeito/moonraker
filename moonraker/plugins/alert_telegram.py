@@ -9,7 +9,7 @@
 
 # Prerequisites
 # /home/pi/moonraker-env/bin/pip install -U git+https://github.com/alexander-akhmetov/python-telegram#egg=python-telegram
-# python-telegram 0.12 doesn't support async
+# current python-telegram 0.12 doesn't support async
 # https://my.telegram.org/auth?to=apps%2F
 
 # To enable, add to moonraker config file "moonraker.conf"
