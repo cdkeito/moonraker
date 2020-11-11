@@ -39,14 +39,14 @@ class AlertDiscord:
         self.server.register_event_handler("server:status_update", self._handle_status_update)
         self.server.register_event_handler("server:klippy_ready", self._process_klippy_ready)
 
-    def _process_klippy_ready(self):
+    async def _process_klippy_ready(self):
         logging.info("_process_klippy_ready")
         klippy_apis = self.server.lookup_plugin('klippy_apis')
         res = klippy_apis.subscribe_objects({'print_stats': None}, None)
         # if res is not None and 'print_stats' in res:
         #     self.currentState = res['print_stats']['state']
 
-    def _handle_status_update(self, status):
+    async def _handle_status_update(self, status):
         discord_on_printing = self.config.getBoolean("discord_on_printing", True)
         discord_on_complete = self.config.getBoolean("discord_on_complete", True)
         discord_on_error = self.config.getBoolean("discord_on_error", True)
@@ -82,11 +82,11 @@ class AlertDiscord:
 
     def _sendMessage(self, discord_text):
         discord_bot_token = self.config.get("discord_bot_token", None)
-        if discord_bot_token  is None:
+        if discord_bot_token is None:
             raise self.server.error("discord_bot_token not configured!")
         discord_is_channel = self.config.getBoolean("discord_is_channel", False)
         discord_id = self.config.get("discord_id", None)
-        if discord_id  is None:
+        if discord_id is None:
             raise self.server.error("discord_id not configured!")
 
         if discord_is_channel:
@@ -95,10 +95,11 @@ class AlertDiscord:
             self._sendMessageToUser(discord_text, discord_id, discord_bot_token)
 
     def _sendMessageToUser(self, discord_text, userid, discord_bot_token):
-        client = discord.Client()
-        client.run(discord_bot_token)
-
         try:
+            logging.info(f"Login to discord")
+            client = discord.Client()
+            client.run(discord_bot_token)
+
             logging.info(f"Sending message: to user {userid}")
             user = client.get_user(userid)
             await user.send(discord_text)
@@ -106,10 +107,11 @@ class AlertDiscord:
             logging.error("Error: unable to send message to user", e)
 
     def _sendMessageToChannel(self, discord_text, channelid, discord_bot_token):
-        client = discord.Client()
-        client.run(discord_bot_token)
-
         try:
+            logging.info(f"Login to discord")
+            client = discord.Client()
+            client.run(discord_bot_token)
+
             logging.info(f"Sending message: to channel {channelid}")
             channel = client.get_channel(channelid)
             await channel.send(discord_text)

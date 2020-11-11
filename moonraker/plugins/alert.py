@@ -48,14 +48,14 @@ class Alert:
         self.server.register_event_handler("server:status_update", self._handle_status_update)
         self.server.register_event_handler("server:klippy_ready", self._process_klippy_ready)
 
-    def _process_klippy_ready(self):
+    async def _process_klippy_ready(self):
         logging.info("_process_klippy_ready")
         klippy_apis = self.server.lookup_plugin('klippy_apis')
         res = klippy_apis.subscribe_objects({'print_stats': None}, None)
         # if res is not None and 'print_stats' in res:
         #     self.currentState = res['print_stats']['state']
 
-    def _handle_status_update(self, status):
+    async def _handle_status_update(self, status):
         mail_on_printing = self.config.getboolean("mail_on_printing", True)
         mail_on_complete = self.config.getboolean("mail_on_complete", True)
         mail_on_error = self.config.getboolean("mail_on_error", True)
