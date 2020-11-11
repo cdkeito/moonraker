@@ -15,15 +15,22 @@
 # smtp_use_ssl: True
 # smtp_username: your.email@google.com
 # smtp_password: your_application_password
+#
 # mail_from: your.email@google.com
 # mail_to: your.email@google.com
+#
+# mail_on_printing: True
 # mail_subject_printing: Voron status printing
-# mail_subject_complete: Voron status complete
-# mail_subject_error: Voron status error
 # mail_text_printing: Your Voron is printing.
 # mail_html_printing: <html><body>Your Voron is printing.</body></html>
+#
+# mail_on_complete: True
+# mail_subject_complete: Voron status complete
 # mail_text_complete: Your Voron job is complete.
 # mail_html_complete: <html><body>Your Voron job is complete.</body></html>
+#
+# mail_on_error: True
+# mail_subject_error: Voron status error
 # mail_text_error: Your Voron has an error. HELP!
 # mail_html_error: <html><body>Your Voron has an <b>error</b>.</br><h2>HELP!</h2></body></html>
 
@@ -49,19 +56,22 @@ class Alert:
         #     self.currentState = res['print_stats']['state']
 
     def _handle_status_update(self, status):
+        mail_on_printing = self.config.getboolean("mail_on_printing", True)
+        mail_on_complete = self.config.getboolean("mail_on_complete", True)
+        mail_on_error = self.config.getboolean("mail_on_error", True)
         if 'print_stats' in status:
             pstats = status['print_stats']
             # Initialize the state (could be "standby", "printing", "paused", "error", "complete")
             if 'state' in pstats:
-                if pstats['state'] == "printing":
+                if pstats['state'] == "printing" and mail_on_printing:
                     # state just transitioned to printing
                     logging.info(f"print_stats.state: {pstats['state']}")
                     self._sendMail_printing()
-                elif pstats['state'] == "complete":
+                elif pstats['state'] == "complete" and mail_on_complete:
                     # state just transitioned to complete
                     logging.info(f"print_stats.state: {pstats['state']}")
                     self._sendMail_complete()
-                elif pstats['state'] == "error":
+                elif pstats['state'] == "error" and mail_on_error:
                     # state just transitioned to error
                     logging.info(f"print_stats.state: {pstats['state']}")
                     self._sendMail_error()
